@@ -1,6 +1,6 @@
 # Set up claude-usage-guard
 
-Instructions for a coding agent. `usage-guard` stops Claude Code when the user's account usage reaches a limit they choose. Do these steps in order. Every step is safe to re-run. Do not edit `settings.json` by hand.
+Instructions for a coding agent. `usage-guard` stops a Claude Code session when the user's account usage reaches a limit they choose. Limits are per session by default, so one session's limit does not stop the user's other sessions. Do these steps in order. Every step is safe to re-run. Do not edit `settings.json` by hand.
 
 ## 1. Prerequisites
 
@@ -23,17 +23,23 @@ This puts `usage-guard` in `~/.local/bin` and adds its status line and hooks to 
 
 Ask these and wait for the answers:
 
-1. Which window should the guard watch: weekly or 5-hour?
-2. At what percentage of that window should work stop?
-3. How many points before the limit should the wind-down start? (The model is told to finish up, and new subagents are refused. The default is 2.)
+1. Should the limit apply to this session only (the normal case), or be a global default for every session that has no limit of its own? Per-session is the normal case; global is for someone who wants a ceiling everywhere.
+2. Which window should the guard watch: weekly or 5-hour?
+3. At what percentage of that window should work stop?
+4. How many points before the limit should the wind-down start? (The model is told to finish up, and new subagents are refused. The default is 2.)
+5. Soft or strict? Soft is the normal choice: at the limit Claude is told to stop and wait, and the user can say "carry on" or "raise the limit to 70" and Claude changes it, which works from a phone. Strict hard-blocks every tool call and prompt at the limit, so lifting it needs a shell.
 
-Do not suggest, assume or fill in a number for question 2. If the user does not give one, ask again. If they skip question 3, leave out `--wind-down`.
+Do not suggest, assume or fill in a number for question 3. If the user does not give one, ask again. If they skip question 4, leave out `--wind-down`. If they skip question 5, use soft (no flag).
 
 ## 4. Set the limit
 
+You are running inside a Claude Code session, so a plain `set` limits this session:
+
 ```bash
-usage-guard set <LIMIT> --window <weekly|5h> [--wind-down <N>]
+usage-guard set <LIMIT> --window <weekly|5h> [--wind-down <N>] [--strict]
 ```
+
+For a global default (every session without its own limit), add `--global`. Do not set both unless the user asked for both.
 
 ## 5. Check
 
@@ -53,7 +59,7 @@ grep -qs '<!-- usage-guard -->' "$f" || cat >>"$f" <<'SNIPPET'
 
 <!-- usage-guard -->
 ## Usage guard
-A usage guard may stop this session when account usage reaches a limit. When you see a "USAGE GUARD (wind-down)" message, finish the current unit of work, commit or save state, write a short handoff note (done / next), start no new subagents or long-running work, and stop. If the guard stops a tool call or a prompt, do not work around it; tell the user and wait. Do not run `usage-guard off` or `usage-guard set` unless the user asks.
+A usage guard may stop this session when account usage reaches its limit. When you see a "USAGE GUARD (wind-down)" message, finish the current unit of work, commit or save state, write a short handoff note (done / next), start no new subagents or long-running work, and stop. When you see "USAGE GUARD (limit reached)", obey it: stop working, save state, tell the user the limit is reached and wait. Carry on only if the user explicitly says to, or asks you to change the limit; then run `usage-guard set <new>` (or `usage-guard off`) as they ask, which is fine. If the guard blocks a tool call or a prompt, do not work around it; tell the user and wait. When the user says "stop this session at N%", run `usage-guard set N` in this session (add `--window 5h` for the 5-hour window, `--strict` to block instead of ask); `usage-guard clear` removes it. Do not run `usage-guard off`, `set` or `clear` on your own initiative.
 SNIPPET
 ```
 <!-- append-snippet-end -->
@@ -62,6 +68,6 @@ SNIPPET
 
 Show the output of `usage-guard status`, then tell the user:
 
-- the limit, window and wind-down that are now set
+- the limit, window and wind-down that are now set, and whether it applies to this session only or globally, and whether it is soft or strict
 - that it starts working once an interactive `claude` session has rendered its status line, so they should start or restart one (readings exist only on Pro and Max plans, and never in `claude -p`)
-- that `usage-guard off` / `on` pauses and resumes it, `usage-guard set <higher>` lifts a stop, and `usage-guard uninstall` removes it and restores their previous status line
+- that at a soft limit they can just tell you "carry on" or "raise the limit to <N>" and you will run `usage-guard set <N>`; that the same `usage-guard set <pct>` works in any other session to limit that one, `usage-guard off` / `on` pauses and resumes the current session, `usage-guard clear` removes its limit, `usage-guard set <higher>` lifts a stop, and `usage-guard uninstall` removes everything and restores their previous status line
