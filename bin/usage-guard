@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# usage-guard: stop a Claude Code session when account usage reaches a chosen limit.
+# https://github.com/ETM-Code/claude-usage-guard (MIT)
+# shellcheck disable=SC2016  # jq programs are single-quoted on purpose
+VERSION=0.1.0
+CFGDIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+GD=$CFGDIR/usage-guard
+
+# jq preamble. evalr turns the config and the last reading into a band:
+# blind (no reading under 15 minutes old) | silent | wind | limit. Times are unix seconds.
+JQ_LIB='
+def num: type == "number";
+def obj: if type == "object" then . else {} end;
+def nowf: try ($ENV.USAGE_GUARD_NOW | tonumber) catch (now | floor);
+def wname: if . == "five_hour" then "5-hour" else "weekly" end;
+def ago: if . < 60 then "\(floor)s" elif . < 3600 then "\(./60|floor)m" elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
+def evalr($cfg; $rd; $now):
+  ($cfg | obj) as $c | ($c.window // "seven_day") as $w | $c.limit as $L
+  | ($rd | obj) as $d | ($d[$w] | obj) as $r
+  | {window: $w, limit: $L, wind_down: ($c.wind_down // 2), resets_at: $r.resets_at, raw: $r.used_percentage,
+     age: (if $d.captured_at | num then $now - $d.captured_at else null end)}
+  | .st = (if (.raw | num | not) or .age == null then "missing" elif .age > 900 then "stale"
+           elif (.resets_at | num) and $now >= .resets_at then "reset" else "ok" end)
+  | .p = (if .st == "reset" then 0 else .raw end)
+  | .band = (if .st == "missing" or .st == "stale" then "blind" elif ($L | num | not) then "silent"
+             elif .p >= $L then "limit" elif .p >= $L - .wind_down then "wind" else "silent" end);
+($cfg | try fromjson catch null) as $cfg | ($rd | try fromjson catch null) as $rd |
+'
+# jqs <program> [jq options]: run jq with $cfg and $rd bound to the config and reading (null if absent or invalid).
+jqs() {
+  local p=$1 c=$GD/config.json r=$GD/usage.json
+  shift
+  [ -r "$c" ] || c=/dev/null
+  [ -r "$r" ] || r=/dev/null
+  jq --rawfile cfg "$c" --rawfile rd "$r" "$@" "$JQ_LIB$p"
+}
+
+# ---- hook <event>: one jq call, silent below the wind-down band, never fails the session ----
+hook_main() {
+  local ev=$1 res f stamp out last
+  exec 2>/dev/null
+  case $ev in SessionStart | UserPromptSubmit | PreToolUse) ;; *) exit 0 ;; esac # Stop etc. are never blocked
+  [ -r "$GD/config.json" ] && command -v jq >/dev/null || exit 0
+  # jq prints three lines: a state file name (or ""), a stamp, and the hook JSON. When a file is
+  # named, the JSON is printed only if the file does not already hold the stamp (once-only notices).
+  res=$(jqs '
+    def id: tostring | gsub("[^A-Za-z0-9_.-]"; "_");
+    def ctx($t): {hookSpecificOutput: {hookEventName: $ev, additionalContext: $t}};
+    (try input catch {}) as $in | evalr($cfg; $rd; nowf) as $e
+    | select(($cfg | type) == "object" and $cfg.enabled != false and ($cfg.limit | num) and $cfg.limit > 0 and $e.band != "silent")
+    | ($in.session_id // "nosession" | id) as $sid
+    | ($e.window | wname) as $wl | ($e.p // 0 | . * 10 | round / 10) as $p | $e.limit as $L
+    | if $e.band == "blind" then
+        ["\($sid).blind", "1", ctx("USAGE GUARD: blind, so the \($L)% limit is not enforced: "
+          + (if $e.st == "stale" then "the last usage reading is \($e.age / 60 | floor) minutes old."
+             else "no usage reading yet (the status line has not rendered; `claude -p` never records one)." end)
+          + " Check `usage-guard doctor`.")]
+      elif $e.band == "wind" then
+        if $ev == "PreToolUse" and ($in.tool_name | IN("Agent", "Task", "Workflow")) then
+          ["", "", {hookSpecificOutput: {hookEventName: $ev, permissionDecision: "deny", permissionDecisionReason:
+            "Usage guard: \($wl) usage is \($p)%, in the wind-down band before the \($L)% limit, so new subagents and workflows are refused. Finish the current work and write a handoff note."}}]
+        else
+          ["\($sid)\(if $in.agent_id then "__" + ($in.agent_id | id) else "" end).last", "\($e.p | floor) \($e.resets_at)",
+           ctx("USAGE GUARD (wind-down): \($wl) usage is \($p)% and work stops at \($L)%, so finish the current unit of work, commit or save state, and write a short handoff note (done / next). Start no new long-running work and no new subagents (Agent and Workflow calls are refused).")]
+        end
+      else
+        "\($wl) usage is \($p)%, at or past the \($L)% limit" as $at
+        | " To continue, run `usage-guard set <higher>` or `usage-guard off`." as $lift
+        | ("Usage guard: \($at), so work is stopped." + (if $e.resets_at | num
+            then " The window resets \($e.resets_at | floor | strftime("%Y-%m-%d %H:%M UTC"))." else "" end) + $lift) as $stop
+        | ["", "", if $ev == "PreToolUse" then {continue: false, stopReason: $stop,
+                     hookSpecificOutput: {hookEventName: $ev, permissionDecision: "deny", permissionDecisionReason: $stop}}
+                   elif $ev == "UserPromptSubmit" then {decision: "block", reason: $stop}
+                   else ctx("USAGE GUARD: \($at); tool calls and new prompts will be stopped." + $lift) end]
+      end
+    | .[0], .[1], (.[2] | tojson)' -nr --arg ev "$ev") || exit 0
+  [ -n "$res" ] || exit 0
+  { IFS= read -r f; IFS= read -r stamp; IFS= read -r out; } <<<"$res"
+  if [ -n "$f" ]; then
+    f=$GD/state/$f last=
+    [ -r "$f" ] && IFS= read -r last <"$f"
+    [ "$last" = "$stamp" ] && exit 0
+    mkdir -p "$GD/state" && printf '%s\n' "$stamp" >"$f"
+    find "$GD/state" -type f -mtime +7 -delete # prune old sessions
+  fi
+  printf '%s\n' "$out"
+  exit 0
+}
+
+# ---- statusline: record the reading, run the user's original status line, append a segment ----
+statusline_main() {
+  local input res merged seg chain orig=
+  input=$(cat)
+  # jq prints the merged reading (or ""), the segment (or ""), then the original status line command.
+  res=$(printf '%s' "$input" | jqs '
+    def pick($o; $n): ($o | obj) as $o | ($n | obj) as $n
+      | if ($n.used_percentage | num | not) then ($o | if .used_percentage | num then . else null end)
+        elif ($o.used_percentage | num | not) then $n
+        elif ($n.resets_at // 0) != ($o.resets_at // 0) then (if ($n.resets_at // 0) > ($o.resets_at // 0) then $n else $o end)
+        elif $n.used_percentage >= $o.used_percentage then $n else $o end;
+    nowf as $now | ($cfg | obj) as $c | (try fromjson catch {}) as $in
+    | if ($in.rate_limits | type) != "object" then "", "" else
+        ($rd | obj) as $old
+        | ({captured_at: $now, five_hour: pick($old.five_hour; $in.rate_limits.five_hour),
+            seven_day: pick($old.seven_day; $in.rate_limits.seven_day)} | with_entries(select(.value != null))) as $m
+        | evalr($c; $m; $now) as $e
+        | ($m | tojson),
+          (if $e.st == "missing" then "" else
+            (if $e.window == "five_hour" then "5h" else "week" end) + " \($e.p | floor)%"
+            + (if ($e.limit | num) and $c.enabled != false
+               then "/\($e.limit)" + ({wind: " wind-down", limit: " STOP"}[$e.band] // "") else "" end)
+           end)
+      end,
+      ($c.original_statusline.command? // "")' -Rsr 2>/dev/null)
+  merged=${res%%$'\n'*} res=${res#*$'\n'}
+  seg=${res%%$'\n'*} chain=${res#*$'\n'}
+  if [ -n "$merged" ]; then
+    mkdir -p "$GD" && printf '%s\n' "$merged" >"$GD/usage.json.tmp.$$" && mv "$GD/usage.json.tmp.$$" "$GD/usage.json"
+  fi
+  [ -n "$chain" ] && orig=$(printf '%s' "$input" | sh -c "$chain" 2>/dev/null)
+  if [ -n "$orig" ] && [ -n "$seg" ]; then printf '%s · %s\n' "$orig" "$seg"
+  elif [ -n "$orig$seg" ]; then printf '%s\n' "$orig$seg"; fi
+  exit 0
+}
+
+case ${1:-} in
+  hook) hook_main "${2:-}" ;;
+  statusline) statusline_main ;;
+esac
+
+# ---- everything below is the CLI ----
+die() { printf 'usage-guard: %s\n' "$*" >&2; exit 1; }
+need_jq() { command -v jq >/dev/null || die "jq is required (macOS: brew install jq; Debian/Ubuntu: sudo apt install jq)"; }
+
+usage() {
+  cat <<'EOF'
+usage-guard: stop Claude Code when account usage reaches a limit
+
+  usage-guard set <pct> [--window weekly|5h] [--wind-down N]   set the limit and turn the guard on
+  usage-guard off | on                                         pause / resume
+  usage-guard status                                           show the limit, reading and band
+  usage-guard doctor                                           check the setup
+  usage-guard install | uninstall [--purge]                    add to / remove from settings.json
+EOF
+}
+
+self_path() {
+  case $0 in
+    /*) printf '%s' "$0" ;;
+    */*) printf '%s/%s' "$PWD" "${0#./}" ;;
+    *) command -v -- "$0" ;;
+  esac
+}
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+settings_path() { # settings.json, following symlinks so a linked file is edited in place
+  local p=$CFGDIR/settings.json t
+  while [ -L "$p" ]; do
+    t=$(readlink "$p")
+    case $t in /*) p=$t ;; *) p=$(dirname "$p")/$t ;; esac
+  done
+  printf '%s' "$p"
+}
+
+cfg_apply() { # cfg_apply <jq filter> [jq args...]: edit config.json
+  local filter=$1 cur='{"enabled":true,"window":"seven_day","wind_down":2}' new
+  shift
+  mkdir -p "$GD"
+  [ -s "$GD/config.json" ] && cur=$(<"$GD/config.json")
+  new=$(printf '%s' "$cur" | jq "$@" "$filter") || die "cannot update $GD/config.json (is it valid JSON?)"
+  printf '%s\n' "$new" >"$GD/config.json.tmp.$$" && mv "$GD/config.json.tmp.$$" "$GD/config.json"
+}
+
+summary() {
+  jqs '($cfg | obj) as $c | evalr($c; $rd; nowf) as $e | ($c.limit | num) as $set
+    | "guard     " + (if ($set | not) then "not configured (no limit set, so it does nothing)" elif $c.enabled == false then "off" else "on" end),
+      "limit     " + (if $set then "\($c.limit)% of the \($e.window | wname) window, wind-down from \($c.limit - $e.wind_down)%" else "none" end),
+      "reading   " + (if $e.st == "missing" then "none yet (recorded when an interactive session renders its status line)"
+        elif $e.st == "stale" then "STALE: \($e.raw)%, \($e.age | ago) old, so the guard is not enforcing"
+        elif $e.st == "reset" then "the window has already reset (was \($e.raw)%), counted as 0%"
+        else "\($e.p)%, \($e.age | ago) old" end),
+      "band      " + (if ($set | not) then "none" else {blind: "blind (not enforcing)", silent: "below the wind-down band",
+        wind: "wind-down", limit: "LIMIT: tool calls and prompts are blocked"}[$e.band] end)' -nr
+}
+
+cmd_set() {
+  need_jq
+  local pct=${1:-} win='' wd=''
+  [[ $pct =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(jq -n "$pct > 0 and $pct <= 100")" = true ] ||
+    die "set needs a limit above 0 and up to 100, e.g. usage-guard set 80"
+  shift
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --window)
+        case ${2:-} in weekly | seven_day) win=seven_day ;; 5h | five_hour) win=five_hour ;; *) die "--window takes weekly or 5h" ;; esac
+        shift 2 ;;
+      --wind-down) [[ ${2:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--wind-down takes a number"; wd=$2; shift 2 ;;
+      *) die "unknown option '$1'" ;;
+    esac
+  done
+  cfg_apply '.enabled = true | .limit = $l | if $w != "" then .window = $w end | if $d != "" then .wind_down = ($d | tonumber) end' \
+    --argjson l "$pct" --arg w "$win" --arg d "$wd"
+  [ "$(install_state)" = installed ] || echo "note: not wired into settings.json yet; run: usage-guard install"
+  summary
+}
+
+# ---- settings.json ----
+OURS='def ours: (.command? // "") | test("usage-guard.? (hook [A-Za-z]+|statusline)$");'
+install_state() { # installed | partial | not installed
+  local n
+  n=$(jq -r "$OURS"'[.statusLine, (.hooks | .SessionStart, .UserPromptSubmit, .PreToolUse | .[]?.hooks[]?)]
+    | map(select(ours)) | length' "$(settings_path)" 2>/dev/null)
+  case $n in 4) echo installed ;; 0 | "") echo "not installed" ;; *) echo partial ;; esac
+}
+
+edit_settings() { # edit_settings <file> <jq args...>: rewrite through jq, backing up first; returns 1 if unchanged
+  local s=$1 tmp=$1.tmp.$$
+  shift
+  cp -p "$s" "$tmp" || die "cannot write beside $s"
+  jq "$@" "$s" >"$tmp" || { rm -f "$tmp"; die "failed to edit $s"; }
+  if cmp -s "$tmp" "$s"; then rm -f "$tmp"; return 1; fi
+  [ "$(<"$s")" = "{}" ] || { cp -p "$s" "$s.usage-guard-backup-$(date +%Y%m%d-%H%M%S)" && echo "backed up $s"; }
+  mv "$tmp" "$s"
+}
+
+cmd_install() {
+  need_jq
+  local s q
+  s=$(settings_path)
+  mkdir -p "$(dirname "$s")"
+  [ -s "$s" ] || printf '{}\n' >"$s"
+  jq -e 'type == "object"' "$s" >/dev/null 2>&1 || die "$s is not a JSON object; fix it first"
+  # Remember the user's own status line so it can be chained and restored.
+  if [ "$(jq "$OURS"'.statusLine | ours' "$s")" != true ]; then
+    cfg_apply '.original_statusline = $o' --argjson o "$(jq -c '.statusLine // null' "$s")"
+  else
+    cfg_apply .
+  fi
+  q=$(sq "$(self_path)")
+  if edit_settings "$s" --arg hc "$q hook" --arg sl "$q statusline" "$OURS"'
+    def obj: if type == "object" then . else {} end;
+    def add($ev): if any(.hooks[$ev][]?.hooks[]?; ours)
+      then .hooks[$ev][].hooks[]? |= (if ours then .command = "\($hc) \($ev)" else . end)
+      else .hooks[$ev] += [{hooks: [{type: "command", command: "\($hc) \($ev)", timeout: 5}]}] end;
+    add("SessionStart") | add("UserPromptSubmit") | add("PreToolUse")
+    | .statusLine = if .statusLine | ours then .statusLine + {command: $sl}
+        else {refreshInterval: 60} + (.statusLine | obj) + {type: "command", command: $sl} end'; then
+    echo "installed into $s"
+  else echo "already installed"; fi
+  [ "$(jq '.limit | type' "$GD/config.json")" = '"number"' ] || echo "next: choose a limit with usage-guard set <pct>, then run usage-guard doctor"
+}
+
+cmd_uninstall() {
+  need_jq
+  local s orig=null
+  s=$(settings_path)
+  if [ -s "$s" ]; then
+    [ -s "$GD/config.json" ] && orig=$(jq -c '.original_statusline // null' "$GD/config.json")
+    if edit_settings "$s" --argjson orig "$orig" "$OURS"'
+      def strip($ev): if .hooks[$ev] then
+          .hooks[$ev] |= map(if any(.hooks[]?; ours) then (.hooks |= map(select(ours | not))) | select(.hooks != []) else . end)
+          | if .hooks[$ev] == [] then del(.hooks[$ev]) end
+        else . end;
+      strip("SessionStart") | strip("UserPromptSubmit") | strip("PreToolUse")
+      | if .hooks == {} then del(.hooks) end
+      | if .statusLine | ours then (if $orig == null then del(.statusLine) else .statusLine = $orig end) end'; then
+      echo "removed from $s"
+    else echo "nothing to remove from $s"; fi
+  fi
+  if [ "${1:-}" = --purge ]; then
+    rm -rf -- "${GD:?}" && echo "deleted $GD; remove the program with: rm \"\$(command -v usage-guard)\""
+  elif [ -s "$GD/config.json" ]; then
+    cfg_apply 'del(.original_statusline)'
+    echo "kept your settings in $GD (--purge deletes them)"
+  fi
+}
+
+cmd_doctor() {
+  need_jq
+  local bad=0 s cmd
+  fail() { printf '  FAIL  %s\n' "$*"; bad=1; }
+  printf '  ok    %s\n' "$(jq --version)"
+  s=$(settings_path)
+  if ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then fail "$s is missing or not a JSON object (run: usage-guard install)"
+  elif [ "$(install_state)" != installed ]; then fail "settings.json: $(install_state) (run: usage-guard install)"
+  else
+    printf '  ok    %s\n' "settings.json has the status line and 3 hooks"
+    cmd=$(jq -r "$OURS"'first(.hooks.PreToolUse[]?.hooks[]? | select(ours) | .command)' "$s")
+    sh -c "${cmd% hook PreToolUse} --version" >/dev/null 2>&1 || fail "the hooks run $cmd, which does not work"
+  fi
+  [ -e "$GD/config.json" ] && ! jq -e . "$GD/config.json" >/dev/null 2>&1 && fail "$GD/config.json is not valid JSON"
+  jqs '($cfg | obj) as $c | evalr($c; $rd; nowf) as $e
+    | "  " + (if ($c.limit | num | not) then "warn  no limit set, so the guard does nothing (usage-guard set <pct>)"
+        elif $c.enabled == false then "warn  the guard is off (usage-guard on)"
+        else "ok    limit \($c.limit)% of the \($e.window | wname) window" end),
+      "  " + (if $e.age == null then "warn  no reading yet: open an interactive claude session so the status line renders (subscribers only)"
+        elif $e.st == "stale" then "warn  the reading is \($e.age | ago) old; it refreshes while an interactive session is open"
+        else "ok    reading is \($e.age | ago) old" end)' -nr
+  exit "$bad"
+}
+
+case ${1:-} in
+  set) shift; cmd_set "$@" ;;
+  on | off) need_jq; cfg_apply ".enabled = $([ "$1" = on ] && echo true || echo false)"; echo "guard $1" ;;
+  status) need_jq; echo "usage-guard $VERSION ($CFGDIR)"; summary; echo "install   $(install_state)" ;;
+  install) cmd_install ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  doctor) cmd_doctor ;;
+  -V | --version | version) echo "usage-guard $VERSION" ;;
+  "" | -h | --help | help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

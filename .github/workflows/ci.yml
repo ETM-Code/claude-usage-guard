@@ -1,0 +1,21 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq and shellcheck
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y jq shellcheck
+          else
+            brew install jq shellcheck
+          fi
+      - run: shellcheck bin/usage-guard install.sh test/run.sh
+      - run: ./test/run.sh
